@@ -1,0 +1,31 @@
+name: MeshCore Proxy
+version: "1.1.0"
+slug: mc_proxy
+description: >-
+  TCP fan-out proxy that lets multiple companions (Home Assistant
+  integration, MeshCore app, meshcore-cli) share a single MeshCore WiFi node.
+url: https://github.com/DinXke/MeshCore-Proxy
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: services
+boot: auto
+init: false
+ports:
+  5000/tcp: 5000
+ports_description:
+  5000/tcp: Proxy-poort waarop companions verbinden
+options:
+  node_host: ""
+  node_port: 5000
+  allowed_ips: []
+  max_clients: 4
+  log_level: info
+schema:
+  node_host: str
+  node_port: port
+  allowed_ips:
+    - str
+  max_clients: int(1,16)
+  log_level: list(debug|info|warning)

@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""MeshCore Proxy — TCP fan-out proxy for MeshCore companion radios over WiFi.
+
+The MeshCore companion firmware accepts only ONE TCP client at a time. This
+proxy holds that single connection and lets multiple clients (the Home
+Assistant integration, the MeshCore app, meshcore-cli) share it:
+
+    WiFi node <--- proxy ---> Home Assistant integration
+                        \\--> MeshCore app
+                        \\--> meshcore-cli
+
+Data flow:
+- client -> node: forwarded per received chunk, serialised with a lock so
+  frames from different clients never interleave mid-frame;
+- node -> clients: every chunk is broadcast to all connected clients. The
+  MeshCore TCP transport is a raw byte stream without extra framing; clients
+  detect frame boundaries at the protocol level themselves.
+
+Security:
+- optional client allow-list (MCP_ALLOWED_IPS, comma-separated IPs/CIDRs);
+- connection cap (MCP_MAX_CLIENTS);
+- the MeshCore TCP protocol itself has NO authentication or encryption —
+  never expose this port outside a trusted network. See the README.
+
+Configuration is taken from environment variables:
+  MCP_NODE_HOST     IP/hostname of the MeshCore WiFi node   (required)
+  MCP_NODE_PORT     TCP port of the node                    (default 5000)
+  MCP_LISTEN_HOST   interface to listen on                  (default 0.0.0.0)
+  MCP_LISTEN_PORT   port to listen on                       (default 5000)
+  MCP_ALLOWED_IPS   comma-separated IPs/CIDRs; empty = all  (default empty)
+  MCP_MAX_CLIENTS   maximum simultaneous clients            (default 4)
+  MCP_RECONNECT_S   seconds between node reconnect attempts (default 1)
+  MCP_LOG_LEVEL     debug / info / warning                  (default info)
+"""
+import asyncio
+import ipaddress
+import logging
+import os
+import sys
+
+NODE_HOST = os.environ.get("MCP_NODE_HOST", "")
+NODE_PORT = int(os.environ.get("MCP_NODE_PORT", "5000"))
+LISTEN_HOST = os.environ.get("MCP_LISTEN_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.environ.get("MCP_LISTEN_PORT", "5000"))
+MAX_CLIENTS = int(os.environ.get("MCP_MAX_CLIENTS", "4"))
+RECONNECT_S = float(os.environ.get("MCP_RECONNECT_S", "1"))
+CHUNK = 4096
+
+log = logging.getLogger("mc-proxy")
+
+
+def parse_allowed(raw: str):
+    """Parse the allow-list; invalid entries are rejected loudly at startup."""
+    networks = []
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            log.error("Ongeldige allow-list entry: %r", part)
+            sys.exit(1)
+    return networks
+
+
+ALLOWED = parse_allowed(os.environ.get("MCP_ALLOWED_IPS", ""))
+
+
+def client_allowed(host: str) -> bool:
+    if not ALLOWED:
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(addr in net for net in ALLOWED)
+
+
+class Proxy:
+    def __init__(self) -> None:
+        self.clients: set[asyncio.StreamWriter] = set()
+        self.up_writer: asyncio.StreamWriter | None = None
+        self.write_lock = asyncio.Lock()
+        self._was_connected = False
+
+    async def upstream_loop(self) -> None:
+        """Keep the single node connection alive; reconnect on loss."""
+        while True:
+            try:
+                reader, writer = await asyncio.open_connection(NODE_HOST, NODE_PORT)
+                self.up_writer = writer
+                self._was_connected = True
+                log.info("connected to node %s:%s", NODE_HOST, NODE_PORT)
+                while True:
+                    data = await reader.read(CHUNK)
+                    if not data:
+                        raise ConnectionError("node closed the connection")
+                    await self.broadcast(data)
+            except Exception as err:  # noqa: BLE001
+                level = logging.WARNING if self._was_connected else logging.DEBUG
+                log.log(level, "node connection lost (%s); retry in %ss", err, RECONNECT_S)
+                self._was_connected = False
+                if self.up_writer is not None:
+                    try:
+                        self.up_writer.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                self.up_writer = None
+                await asyncio.sleep(RECONNECT_S)
+
+    async def broadcast(self, data: bytes) -> None:
+        dead = []
+        for w in list(self.clients):
+            try:
+                w.write(data)
+                await w.drain()
+            except Exception:  # noqa: BLE001
+                dead.append(w)
+        for w in dead:
+            self.clients.discard(w)
+
+    async def handle_client(self, reader: asyncio.StreamReader,
+                            writer: asyncio.StreamWriter) -> None:
+        peer = writer.get_extra_info("peername")
+        host = peer[0] if peer else "?"
+        if not client_allowed(host):
+            log.warning("client %s geweigerd (niet in allow-list)", host)
+            writer.close()
+            return
+        if len(self.clients) >= MAX_CLIENTS:
+            log.warning("client %s geweigerd (max %d clients bereikt)", host, MAX_CLIENTS)
+            writer.close()
+            return
+        self.clients.add(writer)
+        log.info("client %s connected (%d active)", host, len(self.clients))
+        try:
+            while True:
+                data = await reader.read(CHUNK)
+                if not data:
+                    break
+                async with self.write_lock:
+                    up = self.up_writer
+                    if up is not None:
+                        up.write(data)
+                        await up.drain()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            self.clients.discard(writer)
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+            log.info("client %s disconnected (%d left)", host, len(self.clients))
+
+
+async def main() -> None:
+    level = getattr(logging, os.environ.get("MCP_LOG_LEVEL", "info").upper(), logging.INFO)
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+    if not NODE_HOST:
+        log.error("MCP_NODE_HOST is verplicht (IP van je MeshCore WiFi-node)")
+        sys.exit(1)
+    proxy = Proxy()
+    server = await asyncio.start_server(proxy.handle_client, LISTEN_HOST, LISTEN_PORT)
+    log.info("mc-proxy listening on %s:%s — node: %s:%s — allow-list: %s — max clients: %d",
+             LISTEN_HOST, LISTEN_PORT, NODE_HOST, NODE_PORT,
+             ", ".join(str(n) for n in ALLOWED) or "iedereen", MAX_CLIENTS)
+    async with server:
+        await asyncio.gather(server.serve_forever(), proxy.upstream_loop())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
