@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1
+
+- Verbindingen vanaf de Home Assistant-host (localhost/docker-gateway) worden
+  altijd toegelaten, ook met een ingestelde allow-list — de poortmapping laat
+  die binnenkomen met het interne gateway-adres als bron.
+
 ## 1.1.0
 
 - Client-allowlist (`allowed_ips`, IP's of CIDR's) — aanbevolen om in te stellen

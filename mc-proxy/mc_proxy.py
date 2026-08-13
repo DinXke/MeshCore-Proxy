@@ -67,8 +67,28 @@ def parse_allowed(raw: str):
 ALLOWED = parse_allowed(os.environ.get("MCP_ALLOWED_IPS", ""))
 
 
+def _host_gateway_ips() -> set[str]:
+    """Localhost + de default gateway van de container. Verbindingen vanaf de
+    Home Assistant-host komen door de Docker-poortmapping binnen met het
+    gateway-adres als bron; die horen altijd toegelaten te zijn."""
+    ips = {"127.0.0.1", "::1"}
+    try:
+        with open("/proc/net/route", encoding="ascii") as f:
+            for line in f.readlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == "00000000" and parts[2] != "00000000":
+                    raw = int(parts[2], 16).to_bytes(4, "little")
+                    ips.add(str(ipaddress.ip_address(raw)))
+    except (OSError, ValueError):
+        pass
+    return ips
+
+
+ALWAYS_ALLOWED = _host_gateway_ips()
+
+
 def client_allowed(host: str) -> bool:
-    if not ALLOWED:
+    if not ALLOWED or host in ALWAYS_ALLOWED:
         return True
     try:
         addr = ipaddress.ip_address(host)
@@ -166,6 +186,8 @@ async def main() -> None:
     log.info("mc-proxy listening on %s:%s — node: %s:%s — allow-list: %s — max clients: %d",
              LISTEN_HOST, LISTEN_PORT, NODE_HOST, NODE_PORT,
              ", ".join(str(n) for n in ALLOWED) or "iedereen", MAX_CLIENTS)
+    if ALLOWED:
+        log.info("altijd toegelaten (host/gateway): %s", ", ".join(sorted(ALWAYS_ALLOWED)))
     async with server:
         await asyncio.gather(server.serve_forever(), proxy.upstream_loop())
 
