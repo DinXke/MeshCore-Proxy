@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.7.2
+
+- **Eerlijke beurtverdeling**: een client hield de lijn tot 8 s bezet wanneer
+  de node niet antwoordde, waardoor andere clients (en de validatie van de
+  meshcore-integratie) een time-out kregen. Nu wacht een client hoogstens 2 s
+  op zijn beurt en gaat zijn commando er daarna sowieso door; het
+  responsvenster is 3 s.
+- Verouderde interne antwoorden worden bij elk clientcommando opgeruimd, zodat
+  ze nooit een clientantwoord kunnen wegfilteren.
+
 ## 1.7.1
 
 - Oplopende wachttijd tussen mislukte verbindingspogingen (1 s -> max 15 s):

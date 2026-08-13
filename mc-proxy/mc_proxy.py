@@ -48,8 +48,11 @@ IDLE_EVICT_S = float(os.environ.get("MCP_IDLE_EVICT_S", "60"))
 KEEPALIVE_S = float(os.environ.get("MCP_KEEPALIVE_S", "20"))
 # Hoe lang een client de responsestroom exclusief krijgt na zijn commando.
 # Ruim genomen: een trage of net herstarte node antwoordt soms pas na seconden.
-RESP_TIMEOUT_S = float(os.environ.get("MCP_RESP_TIMEOUT_S", "8"))
-RESP_QUIET_S = float(os.environ.get("MCP_RESP_QUIET_S", "0.25"))
+RESP_TIMEOUT_S = float(os.environ.get("MCP_RESP_TIMEOUT_S", "3"))
+RESP_QUIET_S = float(os.environ.get("MCP_RESP_QUIET_S", "0.15"))
+# Hoe lang een client hoogstens op zijn beurt wacht; daarna gaat zijn
+# commando er zonder exclusiviteit door (beter dan een time-out).
+LOCK_WAIT_S = float(os.environ.get("MCP_LOCK_WAIT_S", "2"))
 HANDSHAKE_TIMEOUT_S = float(os.environ.get("MCP_HANDSHAKE_TIMEOUT_S", "10"))
 MAX_SILENT_ROUNDS = int(os.environ.get("MCP_MAX_SILENT_ROUNDS", "2"))
 MAX_RECONNECT_S = float(os.environ.get("MCP_MAX_RECONNECT_S", "15"))
@@ -329,13 +332,22 @@ class Proxy:
         laatste responseframe) of de timeout verstrijkt. Commando's van andere
         clients wachten netjes hun beurt af."""
         loop = asyncio.get_running_loop()
-        async with self.cmd_lock:
+        try:
+            await asyncio.wait_for(self.cmd_lock.acquire(), timeout=LOCK_WAIT_S)
+            got_lock = True
+        except asyncio.TimeoutError:
+            # Beurt duurt te lang (trage node of drukke client): toch doorsturen,
+            # anders zou deze client onnodig een time-out krijgen.
+            got_lock = False
+            log.debug("client wachtte te lang op zijn beurt; commando gaat er toch door")
+        try:
             self.current_commander = writer
             self._resp_seen.clear()
+            # eventuele oude interne antwoorden zijn niet meer relevant
+            self._internal_pending = 0
             up = self.up_writer
             if up is None:
                 log.warning("commando genegeerd: geen verbinding met de node")
-                self.current_commander = None
                 return
             try:
                 self._last_upstream_tx = loop.time()
@@ -343,10 +355,8 @@ class Proxy:
                 await up.drain()
             except Exception as err:  # noqa: BLE001
                 log.warning("doorsturen naar node mislukt: %s", err)
-                self.current_commander = None
                 return
             if not expect_response:
-                self.current_commander = None
                 return
             try:
                 # wacht op de eerste responseframe...
@@ -359,8 +369,10 @@ class Proxy:
                     await asyncio.sleep(RESP_QUIET_S - gap)
             except asyncio.TimeoutError:
                 pass  # commando zonder (tijdig) antwoord
-            finally:
-                self.current_commander = None
+        finally:
+            self.current_commander = None
+            if got_lock:
+                self.cmd_lock.release()
 
     async def handle_client(self, reader: asyncio.StreamReader,
                             writer: asyncio.StreamWriter) -> None:
