@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.8.2
+
+- **Geduldiger tegenover een zwakke node.** Op een slechte wifi-link maakte de
+  proxy het erger door snel af te breken en opnieuw te verbinden. De handshake
+  krijgt nu 30 s (met een herkansing halverwege), de keepalive gaat naar 30 s
+  en er zijn drie stille rondes nodig voor de verbinding wordt vernieuwd.
+- Bewaarde self_info blijft geldig over een herverbinding heen, zodat clients
+  ook tijdens een hapering kunnen aanmelden.
+- Clients worden pas losgekoppeld als de node langer dan 60 s weg is, in plaats
+  van bij elke korte onderbreking.
+
 ## 1.8.1
 
 - **APP_START wordt door de proxy zelf beantwoord.** De companion-firmware

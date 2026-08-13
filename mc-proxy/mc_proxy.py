@@ -28,7 +28,7 @@ Configuration is taken from environment variables:
   MCP_LISTEN_HOST   interface to listen on                  (default 0.0.0.0)
   MCP_LISTEN_PORT   port to listen on                       (default 5000)
   MCP_ALLOWED_IPS   comma-separated IPs/CIDRs; empty = all  (default empty)
-  MCP_MAX_CLIENTS   maximum simultaneous clients            (default 4)
+  MCP_MAX_CLIENTS   maximum simultaneous clients            (default 32)
   MCP_RECONNECT_S   seconds between node reconnect attempts (default 1)
   MCP_LOG_LEVEL     debug / info / warning                  (default info)
 """
@@ -45,13 +45,15 @@ LISTEN_HOST = os.environ.get("MCP_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("MCP_LISTEN_PORT", "5000"))
 MAX_CLIENTS = int(os.environ.get("MCP_MAX_CLIENTS", "32"))
 IDLE_EVICT_S = float(os.environ.get("MCP_IDLE_EVICT_S", "60"))
-KEEPALIVE_S = float(os.environ.get("MCP_KEEPALIVE_S", "20"))
-# Hoe lang een client de responsestroom exclusief krijgt na zijn commando.
-# Ruim genomen: een trage of net herstarte node antwoordt soms pas na seconden.
-HANDSHAKE_TIMEOUT_S = float(os.environ.get("MCP_HANDSHAKE_TIMEOUT_S", "10"))
-MAX_SILENT_ROUNDS = int(os.environ.get("MCP_MAX_SILENT_ROUNDS", "2"))
+KEEPALIVE_S = float(os.environ.get("MCP_KEEPALIVE_S", "30"))
+# Ruim bemeten: een node op een zwakke wifi-link kan er seconden over doen.
+# Te snel afbreken en herverbinden maakt het op zo'n link juist erger.
+HANDSHAKE_TIMEOUT_S = float(os.environ.get("MCP_HANDSHAKE_TIMEOUT_S", "30"))
+MAX_SILENT_ROUNDS = int(os.environ.get("MCP_MAX_SILENT_ROUNDS", "3"))
 MAX_RECONNECT_S = float(os.environ.get("MCP_MAX_RECONNECT_S", "15"))
 HEALTH_PORT = int(os.environ.get("MCP_HEALTH_PORT", "5001"))
+# Hoelang de node weg mag zijn voor clients losgekoppeld worden
+NODE_DOWN_GRACE_S = float(os.environ.get("MCP_NODE_DOWN_GRACE_S", "60"))
 
 # Companion-protocol: frames zijn marker + LE16-lengte + payload.
 # 0x3C ('<') client->node, 0x3E ('>') node->client.
@@ -133,9 +135,6 @@ class Proxy:
         # elkaar naar de node geschreven worden
         self.cmd_lock = asyncio.Lock()
         self._last_resp_t = 0.0
-        # antwoorden op onze eigen handshake/keepalive slikken we op, maar
-        # alleen binnen een kort venster — anders zou een laat clientantwoord
-        # per ongeluk verdwijnen
         self._last_upstream_tx = 0.0
         # De node beantwoordt APP_START maar één keer per TCP-verbinding. De
         # proxy doet die handshake zelf en bewaart het SELF_INFO-antwoord, om
@@ -145,6 +144,7 @@ class Proxy:
         self._node_alive = False
         self._last_node_rx = 0.0
         self._silent_rounds = 0
+        self._node_down_since: float | None = None
 
     async def upstream_loop(self) -> None:
         """Keep the single node connection alive; reconnect on loss. Bij
@@ -157,10 +157,13 @@ class Proxy:
                 self.up_writer = writer
                 self._was_connected = True
                 backoff = RECONNECT_S
+                self._node_down_since = None
                 log.info("connected to node %s:%s", NODE_HOST, NODE_PORT)
-                # meteen aanmelden, anders sluit de node de verbinding weer
+                # meteen aanmelden, anders sluit de node de verbinding weer.
+                # De bewaarde self_info blijft geldig tot de node een nieuwe
+                # stuurt: zo kunnen clients ook tijdens een haperende
+                # nodeverbinding gewoon aanmelden.
                 self._node_alive = False
-                self.self_info_frame = None
                 await self._send_internal(APP_START)
                 # Antwoordt de node niet op de handshake, dan is de firmware
                 # vastgelopen: verbinding sluiten en opnieuw proberen. Een
@@ -203,14 +206,27 @@ class Proxy:
                     except Exception:  # noqa: BLE001
                         pass
                 self.up_writer = None
-                # Zonder node zijn clientsessies waardeloos: sluit ze zodat
-                # niemand op een dode lijn wacht en slots niet dichtslibben.
-                await self.drop_clients("nodeverbinding weg")
+                # Clients pas loskoppelen als de node echt langere tijd weg is.
+                # Bij een haperende verbinding (zwakke wifi) is het beter dat
+                # clients verbonden blijven: ze zien even geen data en kunnen
+                # daarna gewoon verder, zonder herverbindingsstorm.
+                if self._node_down_since is None:
+                    self._node_down_since = asyncio.get_running_loop().time()
+                elif (asyncio.get_running_loop().time() - self._node_down_since
+                      > NODE_DOWN_GRACE_S and self.clients):
+                    await self.drop_clients("node al langer dan "
+                                            f"{NODE_DOWN_GRACE_S:.0f}s onbereikbaar")
                 await asyncio.sleep(backoff)
 
     async def _handshake_watchdog(self) -> None:
-        """Sluit de nodeverbinding als er na de handshake niets terugkomt."""
-        await asyncio.sleep(HANDSHAKE_TIMEOUT_S)
+        """Sluit de nodeverbinding pas als de node ook na een herkansing niets
+        terugstuurt. Op een zwakke link is geduld beter dan opnieuw verbinden."""
+        await asyncio.sleep(HANDSHAKE_TIMEOUT_S / 2)
+        if self._node_alive or self.up_writer is None:
+            return
+        log.info("nog geen antwoord op de handshake; nog één poging")
+        await self._send_internal(APP_START)
+        await asyncio.sleep(HANDSHAKE_TIMEOUT_S / 2)
         if self._node_alive or self.up_writer is None:
             return
         log.warning("node antwoordt niet op de handshake (firmware vastgelopen?); "
@@ -293,10 +309,11 @@ class Proxy:
         self._last_resp_t = asyncio.get_running_loop().time()
         # SELF_INFO (type 0x05) bewaren: hiermee beantwoorden we de APP_START
         # van clients, die de node zelf een tweede keer niet meer beantwoordt.
-        if len(frame) >= 4 and frame[3] == PKT_SELF_INFO and self.self_info_frame is None:
+        if len(frame) >= 4 and frame[3] == PKT_SELF_INFO:
+            if self.self_info_frame != frame:
+                log.info("self_info van de node bewaard (%d bytes) — clients "
+                         "kunnen aanmelden", len(frame))
             self.self_info_frame = frame
-            log.info("self_info van de node bewaard (%d bytes) — clients kunnen "
-                     "nu aanmelden", len(frame))
         await self.broadcast(frame)
 
     async def broadcast(self, data: bytes) -> None:
