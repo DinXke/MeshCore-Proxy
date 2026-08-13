@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0
+
+- **Slimme routering**: command-responses van de node gaan alleen nog naar de
+  client die het commando stuurde; push-frames (adverts, inkomende berichten,
+  eerste byte >= 0x80) gaan naar alle clients. Voorheen kreeg elke client
+  andermans antwoorden te zien, waardoor sommige clients (o.a. de
+  meshcore-integratie) in een reconnect-storm belandden.
+
 ## 1.1.3
 
 - Verdringing bij volle client-slots gebeurt alleen nog bij sessies die

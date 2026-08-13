@@ -106,6 +106,9 @@ class Proxy:
         self.up_writer: asyncio.StreamWriter | None = None
         self.write_lock = asyncio.Lock()
         self._was_connected = False
+        # de client die het laatst een commando stuurde: responses gaan alleen
+        # daarheen; push-frames (eerste byte >= 0x80) gaan naar iedereen
+        self.last_commander: asyncio.StreamWriter | None = None
 
     async def upstream_loop(self) -> None:
         """Keep the single node connection alive; reconnect on loss."""
@@ -119,7 +122,7 @@ class Proxy:
                     data = await reader.read(CHUNK)
                     if not data:
                         raise ConnectionError("node closed the connection")
-                    await self.broadcast(data)
+                    await self.dispatch(data)
             except Exception as err:  # noqa: BLE001
                 level = logging.WARNING if self._was_connected else logging.DEBUG
                 log.log(level, "node connection lost (%s); retry in %ss", err, RECONNECT_S)
@@ -131,6 +134,22 @@ class Proxy:
                         pass
                 self.up_writer = None
                 await asyncio.sleep(RECONNECT_S)
+
+    async def dispatch(self, data: bytes) -> None:
+        """Routeer node-data: push-frames (eerste byte >= 0x80, bv. adverts en
+        inkomende berichten) naar alle clients; command-responses alleen naar
+        de client die het laatst een commando stuurde. Zo raakt geen enkele
+        client in de war van andermans antwoorden."""
+        if data and data[0] < 0x80:
+            target = self.last_commander
+            if target is not None and target in self.clients:
+                try:
+                    target.write(data)
+                    await target.drain()
+                    return
+                except Exception:  # noqa: BLE001
+                    self.clients.pop(target, None)
+        await self.broadcast(data)
 
     async def broadcast(self, data: bytes) -> None:
         dead = []
@@ -184,6 +203,7 @@ class Proxy:
                 if meta is not None:
                     meta["last_tx"] = asyncio.get_running_loop().time()
                 async with self.write_lock:
+                    self.last_commander = writer
                     up = self.up_writer
                     if up is not None:
                         up.write(data)
