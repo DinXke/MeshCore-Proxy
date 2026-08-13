@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.8.1
+
+- **APP_START wordt door de proxy zelf beantwoord.** De companion-firmware
+  beantwoordt APP_START maar één keer per TCP-verbinding: de proxy doet die
+  handshake bij het verbinden, waarna élke APP_START van een client door de
+  node genegeerd werd. Clients bleven daardoor hangen op "connecting" of
+  "failed to fetch device info". De proxy bewaart nu het SELF_INFO-antwoord
+  van de node en beantwoordt daarmee de aanmelding van elke client.
+  Dit was de hoofdoorzaak van vrijwel alle verbindingsproblemen.
+
 ## 1.8.0
 
 - **Vereenvoudigde routering**: elk nodeframe gaat naar alle clients; clients

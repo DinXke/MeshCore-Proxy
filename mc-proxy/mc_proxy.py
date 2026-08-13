@@ -48,11 +48,6 @@ IDLE_EVICT_S = float(os.environ.get("MCP_IDLE_EVICT_S", "60"))
 KEEPALIVE_S = float(os.environ.get("MCP_KEEPALIVE_S", "20"))
 # Hoe lang een client de responsestroom exclusief krijgt na zijn commando.
 # Ruim genomen: een trage of net herstarte node antwoordt soms pas na seconden.
-RESP_TIMEOUT_S = float(os.environ.get("MCP_RESP_TIMEOUT_S", "3"))
-RESP_QUIET_S = float(os.environ.get("MCP_RESP_QUIET_S", "0.15"))
-# Hoe lang een client hoogstens op zijn beurt wacht; daarna gaat zijn
-# commando er zonder exclusiviteit door (beter dan een time-out).
-LOCK_WAIT_S = float(os.environ.get("MCP_LOCK_WAIT_S", "2"))
 HANDSHAKE_TIMEOUT_S = float(os.environ.get("MCP_HANDSHAKE_TIMEOUT_S", "10"))
 MAX_SILENT_ROUNDS = int(os.environ.get("MCP_MAX_SILENT_ROUNDS", "2"))
 MAX_RECONNECT_S = float(os.environ.get("MCP_MAX_RECONNECT_S", "15"))
@@ -62,6 +57,7 @@ HEALTH_PORT = int(os.environ.get("MCP_HEALTH_PORT", "5001"))
 # 0x3C ('<') client->node, 0x3E ('>') node->client.
 CMD_APP_START = 0x01
 CMD_GET_DEVICE_TIME = 0x05
+PKT_SELF_INFO = 0x05  # antwoordtype op APP_START
 
 
 def frame(payload: bytes) -> bytes:
@@ -133,11 +129,18 @@ class Proxy:
         self.clients: dict[asyncio.StreamWriter, dict] = {}
         self.up_writer: asyncio.StreamWriter | None = None
         self._was_connected = False
-        # korte vergrendeling zodat frames van twee clients niet
-        # door elkaar naar de node geschreven worden
+        # korte vergrendeling: voorkomt dat frames van twee clients door
+        # elkaar naar de node geschreven worden
         self.cmd_lock = asyncio.Lock()
         self._last_resp_t = 0.0
+        # antwoorden op onze eigen handshake/keepalive slikken we op, maar
+        # alleen binnen een kort venster — anders zou een laat clientantwoord
+        # per ongeluk verdwijnen
         self._last_upstream_tx = 0.0
+        # De node beantwoordt APP_START maar één keer per TCP-verbinding. De
+        # proxy doet die handshake zelf en bewaart het SELF_INFO-antwoord, om
+        # daarmee de APP_START van elke client te beantwoorden.
+        self.self_info_frame: bytes | None = None
         # nodegezondheid: antwoordt hij nog op onze frames?
         self._node_alive = False
         self._last_node_rx = 0.0
@@ -157,6 +160,7 @@ class Proxy:
                 log.info("connected to node %s:%s", NODE_HOST, NODE_PORT)
                 # meteen aanmelden, anders sluit de node de verbinding weer
                 self._node_alive = False
+                self.self_info_frame = None
                 await self._send_internal(APP_START)
                 # Antwoordt de node niet op de handshake, dan is de firmware
                 # vastgelopen: verbinding sluiten en opnieuw proberen. Een
@@ -234,7 +238,8 @@ class Proxy:
         if up is None:
             return
         try:
-            self._last_upstream_tx = asyncio.get_running_loop().time()
+            loop = asyncio.get_running_loop()
+            self._last_upstream_tx = loop.time()
             up.write(data)
             await up.drain()
         except Exception:  # noqa: BLE001
@@ -280,20 +285,37 @@ class Proxy:
                     pass
 
     async def dispatch(self, frame: bytes) -> None:
-        """Elk nodeframe gaat naar alle verbonden clients. Clients matchen zelf
-        wat bij hun eigen commando hoort; een frame dat ze niet verwachten
-        negeren ze. Dit is bewust simpel: eerdere versies probeerden
-        antwoorden aan één vrager toe te wijzen, waarbij een drukke client
-        andermans antwoord kon inpikken of het antwoord verloren ging."""
+        """Elk compleet nodeframe gaat naar alle verbonden clients; die matchen
+        zelf wat bij hun eigen commando hoort, net zoals ze rechtstreeks op de
+        node zouden doen. Eerdere versies wezen antwoorden toe aan 'de huidige
+        vrager', maar dan kon een drukke client andermans antwoord inpikken of
+        ging het antwoord verloren."""
         self._last_resp_t = asyncio.get_running_loop().time()
+        # SELF_INFO (type 0x05) bewaren: hiermee beantwoorden we de APP_START
+        # van clients, die de node zelf een tweede keer niet meer beantwoordt.
+        if len(frame) >= 4 and frame[3] == PKT_SELF_INFO and self.self_info_frame is None:
+            self.self_info_frame = frame
+            log.info("self_info van de node bewaard (%d bytes) — clients kunnen "
+                     "nu aanmelden", len(frame))
         await self.broadcast(frame)
+
+    async def broadcast(self, data: bytes) -> None:
+        dead = []
+        for w in list(self.clients):
+            try:
+                w.write(data)
+                await w.drain()
+            except Exception:  # noqa: BLE001
+                dead.append(w)
+        for w in dead:
+            self.clients.pop(w, None)
 
     async def _exchange(self, writer: asyncio.StreamWriter, data: bytes,
                         expect_response: bool = True) -> None:
         """Stuur één commandoframe naar de node. De vergrendeling is kort en
         dient enkel om te voorkomen dat frames van twee clients door elkaar
-        geschreven worden; op het antwoord wachten we niet (dat gaat via
-        broadcast naar alle clients)."""
+        geschreven worden; op het antwoord wachten we niet — dat gaat via
+        broadcast naar alle clients."""
         async with self.cmd_lock:
             up = self.up_writer
             if up is None:
@@ -306,4 +328,140 @@ class Proxy:
             except Exception as err:  # noqa: BLE001
                 log.warning("doorsturen naar node mislukt: %s", err)
 
+    async def handle_client(self, reader: asyncio.StreamReader,
+                            writer: asyncio.StreamWriter) -> None:
+        peer = writer.get_extra_info("peername")
+        host = peer[0] if peer else "?"
+        if not client_allowed(host):
+            log.warning("client %s geweigerd (niet in allow-list)", host)
+            writer.close()
+            return
+        loop = asyncio.get_running_loop()
+        if len(self.clients) >= MAX_CLIENTS:
+            # vervang alleen een sessie die al IDLE_EVICT_S niets meer stuurde;
+            # actieve verbindingen (bv. van de meshcore-integratie) blijven staan
+            now = loop.time()
+            idle = [(w, m) for w, m in self.clients.items()
+                    if now - m["last_tx"] > IDLE_EVICT_S]
+            if idle:
+                victim, meta = idle[0]
+                log.warning("max %d clients: inactieve sessie (%s, %.0fs stil) "
+                            "vervangen door %s", MAX_CLIENTS, meta["host"],
+                            now - meta["last_tx"], host)
+                self.clients.pop(victim, None)
+                try:
+                    victim.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                log.warning("client %s geweigerd (%d actieve clients, geen inactieve)",
+                            host, len(self.clients))
+                writer.close()
+                return
+        self.clients[writer] = {"host": host, "last_tx": loop.time()}
+        log.info("client %s connected (%d active)", host, len(self.clients))
+        try:
+            buf = b""
+            while True:
+                data = await reader.read(CHUNK)
+                if not data:
+                    break
+                meta = self.clients.get(writer)
+                if meta is not None:
+                    meta["last_tx"] = asyncio.get_running_loop().time()
+                buf += data
+                # Client -> node frames: 0x3C ('<') + lengte (LE16) + payload;
+                # elk compleet commandoframe wordt als één exchange behandeld
+                while True:
+                    if len(buf) < 3:
+                        break
+                    if buf[0] != 0x3C:
+                        nxt = buf.find(b"<", 1)
+                        junk, buf = (buf, b"") if nxt < 0 else (buf[:nxt], buf[nxt:])
+                        await self._exchange(writer, junk, expect_response=False)
+                        continue
+                    ln = buf[1] | (buf[2] << 8)
+                    if len(buf) < 3 + ln:
+                        break
+                    frame, buf = buf[:3 + ln], buf[3 + ln:]
+                    # APP_START zelf beantwoorden: de node doet dat maar één
+                    # keer per verbinding en negeert die van clients.
+                    if (len(frame) >= 4 and frame[3] == CMD_APP_START
+                            and self.self_info_frame is not None):
+                        log.debug("APP_START van %s beantwoord uit cache", host)
+                        try:
+                            writer.write(self.self_info_frame)
+                            await writer.drain()
+                        except Exception:  # noqa: BLE001
+                            break
+                        continue
+                    await self._exchange(writer, frame)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            self.clients.pop(writer, None)
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+            log.info("client %s disconnected (%d left)", host, len(self.clients))
 
+
+async def health_server(proxy: "Proxy") -> None:
+    """Mini-HTTP-statuspagina: http://<host>:<health_port>/ geeft JSON met de
+    toestand van de nodeverbinding en de clients. Handig om op afstand te zien
+    of de node antwoordt zonder in de add-on-logs te moeten duiken."""
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await asyncio.wait_for(reader.readline(), timeout=5)
+            loop = asyncio.get_running_loop()
+            body = json.dumps({
+                "node_host": f"{NODE_HOST}:{NODE_PORT}",
+                "node_connected": proxy.up_writer is not None,
+                "node_answering": proxy._node_alive,
+                "seconds_since_node_data": (
+                    None if not proxy._last_node_rx
+                    else round(loop.time() - proxy._last_node_rx, 1)),
+                "silent_keepalive_rounds": proxy._silent_rounds,
+                "clients": [m["host"] for m in proxy.clients.values()],
+                "client_count": len(proxy.clients),
+                "max_clients": MAX_CLIENTS,
+            }, indent=1).encode()
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                         b"Content-Length: " + str(len(body)).encode() +
+                         b"\r\nConnection: close\r\n\r\n" + body)
+            await writer.drain()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    server = await asyncio.start_server(handle, LISTEN_HOST, HEALTH_PORT)
+    log.info("statuspagina op http://%s:%s/", LISTEN_HOST, HEALTH_PORT)
+    async with server:
+        await server.serve_forever()
+
+
+async def main() -> None:
+    level = getattr(logging, os.environ.get("MCP_LOG_LEVEL", "info").upper(), logging.INFO)
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+    if not NODE_HOST:
+        log.error("MCP_NODE_HOST is verplicht (IP van je MeshCore WiFi-node)")
+        sys.exit(1)
+    proxy = Proxy()
+    server = await asyncio.start_server(proxy.handle_client, LISTEN_HOST, LISTEN_PORT)
+    log.info("mc-proxy listening on %s:%s — node: %s:%s — allow-list: %s — max clients: %d",
+             LISTEN_HOST, LISTEN_PORT, NODE_HOST, NODE_PORT,
+             ", ".join(str(n) for n in ALLOWED) or "iedereen", MAX_CLIENTS)
+    if ALLOWED:
+        log.info("altijd toegelaten (host/gateway): %s", ", ".join(sorted(ALWAYS_ALLOWED)))
+    async with server:
+        await asyncio.gather(server.serve_forever(), proxy.upstream_loop(),
+                             proxy.keepalive_loop(), health_server(proxy))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
