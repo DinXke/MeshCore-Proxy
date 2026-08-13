@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.8.0
+
+- **Vereenvoudigde routering**: elk nodeframe gaat naar alle clients; clients
+  matchen zelf wat bij hun commando hoort. De eerdere "antwoord alleen naar de
+  vrager"-logica kon bij meerdere actieve clients antwoorden bij de verkeerde
+  client afleveren of laten verdwijnen. De vergrendeling dient nu alleen nog
+  om te voorkomen dat frames van twee clients door elkaar geschreven worden.
+- Hiermee vervalt ook de kans dat een drukke client de lijn blokkeert.
+
 ## 1.7.2
 
 - **Eerlijke beurtverdeling**: een client hield de lijn tot 8 s bezet wanneer

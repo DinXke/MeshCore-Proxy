@@ -1,5 +1,5 @@
 name: MeshCore Proxy
-version: "1.7.2"
+version: "1.8.0"
 slug: mc_proxy
 description: >-
   TCP fan-out proxy that lets multiple companions (Home Assistant
