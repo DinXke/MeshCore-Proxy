@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.7.1
+
+- Oplopende wachttijd tussen mislukte verbindingspogingen (1 s -> max 15 s):
+  een node met een zwakke of vastgelopen netwerkstack wordt niet langer elke
+  seconde bestookt
+- Inactieve clientsessies worden periodiek opgeruimd, zodat de slots niet
+  dichtslibben met verweesde verbindingen
+
 ## 1.7.0
 
 - **Statuspagina** op poort 5001 (JSON): laat zien of de node verbonden is,

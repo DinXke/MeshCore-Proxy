@@ -52,6 +52,7 @@ RESP_TIMEOUT_S = float(os.environ.get("MCP_RESP_TIMEOUT_S", "8"))
 RESP_QUIET_S = float(os.environ.get("MCP_RESP_QUIET_S", "0.25"))
 HANDSHAKE_TIMEOUT_S = float(os.environ.get("MCP_HANDSHAKE_TIMEOUT_S", "10"))
 MAX_SILENT_ROUNDS = int(os.environ.get("MCP_MAX_SILENT_ROUNDS", "2"))
+MAX_RECONNECT_S = float(os.environ.get("MCP_MAX_RECONNECT_S", "15"))
 HEALTH_PORT = int(os.environ.get("MCP_HEALTH_PORT", "5001"))
 
 # Companion-protocol: frames zijn marker + LE16-lengte + payload.
@@ -148,12 +149,16 @@ class Proxy:
         self._silent_rounds = 0
 
     async def upstream_loop(self) -> None:
-        """Keep the single node connection alive; reconnect on loss."""
+        """Keep the single node connection alive; reconnect on loss. Bij
+        aanhoudend falen loopt de wachttijd op, zodat een zieke node niet
+        elke seconde bestookt wordt."""
+        backoff = RECONNECT_S
         while True:
             try:
                 reader, writer = await asyncio.open_connection(NODE_HOST, NODE_PORT)
                 self.up_writer = writer
                 self._was_connected = True
+                backoff = RECONNECT_S
                 log.info("connected to node %s:%s", NODE_HOST, NODE_PORT)
                 # meteen aanmelden, anders sluit de node de verbinding weer
                 self._node_alive = False
@@ -202,7 +207,7 @@ class Proxy:
                 # Zonder node zijn clientsessies waardeloos: sluit ze zodat
                 # niemand op een dode lijn wacht en slots niet dichtslibben.
                 await self.drop_clients("nodeverbinding weg")
-                await asyncio.sleep(RECONNECT_S)
+                await asyncio.sleep(backoff)
 
     async def _handshake_watchdog(self) -> None:
         """Sluit de nodeverbinding als er na de handshake niets terugkomt."""
@@ -255,6 +260,16 @@ class Proxy:
                 continue
             if self.cmd_lock.locked():
                 continue
+            # inactieve sessies opruimen zodat slots niet dichtslibben
+            now = asyncio.get_running_loop().time()
+            for w, m in list(self.clients.items()):
+                if now - m["last_tx"] > IDLE_EVICT_S * 3:
+                    log.info("inactieve client %s opgeruimd", m["host"])
+                    self.clients.pop(w, None)
+                    try:
+                        w.close()
+                    except Exception:  # noqa: BLE001
+                        pass
             before = self._last_node_rx
             async with self.cmd_lock:
                 await self._send_internal(DEVICE_TIME)
