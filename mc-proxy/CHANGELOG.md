@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.3
+
+- Verdringing bij volle client-slots gebeurt alleen nog bij sessies die
+  >60 s niets meer stuurden; actieve verbindingen (de meshcore-integratie
+  gebruikt er meerdere tegelijk) blijven onaangeroerd
+- Standaard `max_clients` verhoogd van 4 naar 8
+
 ## 1.1.2
 
 - Bij het bereiken van `max_clients` wordt de oudste verbinding vervangen

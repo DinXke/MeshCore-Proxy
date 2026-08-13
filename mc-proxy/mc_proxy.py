@@ -42,7 +42,8 @@ NODE_HOST = os.environ.get("MCP_NODE_HOST", "")
 NODE_PORT = int(os.environ.get("MCP_NODE_PORT", "5000"))
 LISTEN_HOST = os.environ.get("MCP_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("MCP_LISTEN_PORT", "5000"))
-MAX_CLIENTS = int(os.environ.get("MCP_MAX_CLIENTS", "4"))
+MAX_CLIENTS = int(os.environ.get("MCP_MAX_CLIENTS", "8"))
+IDLE_EVICT_S = float(os.environ.get("MCP_IDLE_EVICT_S", "60"))
 RECONNECT_S = float(os.environ.get("MCP_RECONNECT_S", "1"))
 CHUNK = 4096
 
@@ -99,9 +100,9 @@ def client_allowed(host: str) -> bool:
 
 class Proxy:
     def __init__(self) -> None:
-        # dict behoudt invoegvolgorde: nodig om bij een volle bak de oudste
-        # (vaak gestrande) verbinding te kunnen vervangen
-        self.clients: dict[asyncio.StreamWriter, str] = {}
+        # dict behoudt invoegvolgorde; per client ook het laatste zendmoment,
+        # zodat we bij een volle bak alleen echt inactieve sessies vervangen
+        self.clients: dict[asyncio.StreamWriter, dict] = {}
         self.up_writer: asyncio.StreamWriter | None = None
         self.write_lock = asyncio.Lock()
         self._was_connected = False
@@ -150,23 +151,38 @@ class Proxy:
             log.warning("client %s geweigerd (niet in allow-list)", host)
             writer.close()
             return
+        loop = asyncio.get_running_loop()
         if len(self.clients) >= MAX_CLIENTS:
-            # vervang de oudste verbinding (meestal een gestrande sessie)
-            oldest, oldest_host = next(iter(self.clients.items()))
-            log.warning("max %d clients: oudste verbinding (%s) vervangen door %s",
-                        MAX_CLIENTS, oldest_host, host)
-            self.clients.pop(oldest, None)
-            try:
-                oldest.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self.clients[writer] = host
+            # vervang alleen een sessie die al IDLE_EVICT_S niets meer stuurde;
+            # actieve verbindingen (bv. van de meshcore-integratie) blijven staan
+            now = loop.time()
+            idle = [(w, m) for w, m in self.clients.items()
+                    if now - m["last_tx"] > IDLE_EVICT_S]
+            if idle:
+                victim, meta = idle[0]
+                log.warning("max %d clients: inactieve sessie (%s, %.0fs stil) "
+                            "vervangen door %s", MAX_CLIENTS, meta["host"],
+                            now - meta["last_tx"], host)
+                self.clients.pop(victim, None)
+                try:
+                    victim.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                log.warning("client %s geweigerd (%d actieve clients, geen inactieve)",
+                            host, len(self.clients))
+                writer.close()
+                return
+        self.clients[writer] = {"host": host, "last_tx": loop.time()}
         log.info("client %s connected (%d active)", host, len(self.clients))
         try:
             while True:
                 data = await reader.read(CHUNK)
                 if not data:
                     break
+                meta = self.clients.get(writer)
+                if meta is not None:
+                    meta["last_tx"] = asyncio.get_running_loop().time()
                 async with self.write_lock:
                     up = self.up_writer
                     if up is not None:
