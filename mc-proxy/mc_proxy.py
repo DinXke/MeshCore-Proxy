@@ -49,6 +49,8 @@ KEEPALIVE_S = float(os.environ.get("MCP_KEEPALIVE_S", "20"))
 # Ruim genomen: een trage of net herstarte node antwoordt soms pas na seconden.
 RESP_TIMEOUT_S = float(os.environ.get("MCP_RESP_TIMEOUT_S", "8"))
 RESP_QUIET_S = float(os.environ.get("MCP_RESP_QUIET_S", "0.25"))
+HANDSHAKE_TIMEOUT_S = float(os.environ.get("MCP_HANDSHAKE_TIMEOUT_S", "10"))
+MAX_SILENT_ROUNDS = int(os.environ.get("MCP_MAX_SILENT_ROUNDS", "2"))
 
 # Companion-protocol: frames zijn marker + LE16-lengte + payload.
 # 0x3C ('<') client->node, 0x3E ('>') node->client.
@@ -138,6 +140,10 @@ class Proxy:
         self._internal_pending = 0
         self._internal_until = 0.0
         self._last_upstream_tx = 0.0
+        # nodegezondheid: antwoordt hij nog op onze frames?
+        self._node_alive = False
+        self._last_node_rx = 0.0
+        self._silent_rounds = 0
 
     async def upstream_loop(self) -> None:
         """Keep the single node connection alive; reconnect on loss."""
@@ -148,12 +154,22 @@ class Proxy:
                 self._was_connected = True
                 log.info("connected to node %s:%s", NODE_HOST, NODE_PORT)
                 # meteen aanmelden, anders sluit de node de verbinding weer
+                self._node_alive = False
                 await self._send_internal(APP_START)
+                # Antwoordt de node niet op de handshake, dan is de firmware
+                # vastgelopen: verbinding sluiten en opnieuw proberen. Een
+                # verse TCP-sessie brengt een half-vastgelopen node meestal bij.
+                asyncio.create_task(self._handshake_watchdog())
                 buf = b""
                 while True:
                     data = await reader.read(CHUNK)
                     if not data:
                         raise ConnectionError("node closed the connection")
+                    if not self._node_alive:
+                        log.info("node antwoordt — verbinding is gezond")
+                    self._node_alive = True
+                    self._silent_rounds = 0
+                    self._last_node_rx = asyncio.get_running_loop().time()
                     buf += data
                     # Node -> client frames: 0x3E ('>') + lengte (LE16) + payload
                     while True:
@@ -185,6 +201,18 @@ class Proxy:
                 # niemand op een dode lijn wacht en slots niet dichtslibben.
                 await self.drop_clients("nodeverbinding weg")
                 await asyncio.sleep(RECONNECT_S)
+
+    async def _handshake_watchdog(self) -> None:
+        """Sluit de nodeverbinding als er na de handshake niets terugkomt."""
+        await asyncio.sleep(HANDSHAKE_TIMEOUT_S)
+        if self._node_alive or self.up_writer is None:
+            return
+        log.warning("node antwoordt niet op de handshake (firmware vastgelopen?); "
+                    "verbinding opnieuw opbouwen")
+        try:
+            self.up_writer.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     async def drop_clients(self, reason: str) -> None:
         if not self.clients:
@@ -225,8 +253,22 @@ class Proxy:
                 continue
             if self.cmd_lock.locked():
                 continue
+            before = self._last_node_rx
             async with self.cmd_lock:
                 await self._send_internal(DEVICE_TIME)
+            await asyncio.sleep(HANDSHAKE_TIMEOUT_S)
+            if self._last_node_rx > before:
+                continue
+            self._silent_rounds += 1
+            log.warning("node antwoordde niet op de keepalive (%d/%d)",
+                        self._silent_rounds, MAX_SILENT_ROUNDS)
+            if self._silent_rounds >= MAX_SILENT_ROUNDS and self.up_writer is not None:
+                log.warning("node reageert niet meer; verbinding opnieuw opbouwen")
+                self._silent_rounds = 0
+                try:
+                    self.up_writer.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def dispatch(self, frame: bytes) -> None:
         """Routeer één compleet nodeframe (0x3E + len + payload). Het

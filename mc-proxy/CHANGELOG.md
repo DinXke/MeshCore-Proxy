@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.0
+
+- **Zelfherstel bij een vastgelopen node.** De companion-firmware kan in een
+  toestand raken waarin ze TCP nog accepteert maar niets meer beantwoordt.
+  De proxy detecteert dat nu: geen antwoord op de handshake (10 s) of twee
+  keepalives op rij zonder antwoord -> verbinding sluiten en opnieuw
+  opbouwen. Een verse TCP-sessie brengt zo'n node meestal weer bij.
+- Duidelijke logmeldingen over de nodegezondheid ("node antwoordt", "node
+  reageert niet meer").
+
 ## 1.5.1
 
 - Responsvenster van 2 s naar 8 s: een trage of net herstarte node antwoordt
