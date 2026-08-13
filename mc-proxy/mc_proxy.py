@@ -99,7 +99,9 @@ def client_allowed(host: str) -> bool:
 
 class Proxy:
     def __init__(self) -> None:
-        self.clients: set[asyncio.StreamWriter] = set()
+        # dict behoudt invoegvolgorde: nodig om bij een volle bak de oudste
+        # (vaak gestrande) verbinding te kunnen vervangen
+        self.clients: dict[asyncio.StreamWriter, str] = {}
         self.up_writer: asyncio.StreamWriter | None = None
         self.write_lock = asyncio.Lock()
         self._was_connected = False
@@ -138,7 +140,7 @@ class Proxy:
             except Exception:  # noqa: BLE001
                 dead.append(w)
         for w in dead:
-            self.clients.discard(w)
+            self.clients.pop(w, None)
 
     async def handle_client(self, reader: asyncio.StreamReader,
                             writer: asyncio.StreamWriter) -> None:
@@ -149,10 +151,16 @@ class Proxy:
             writer.close()
             return
         if len(self.clients) >= MAX_CLIENTS:
-            log.warning("client %s geweigerd (max %d clients bereikt)", host, MAX_CLIENTS)
-            writer.close()
-            return
-        self.clients.add(writer)
+            # vervang de oudste verbinding (meestal een gestrande sessie)
+            oldest, oldest_host = next(iter(self.clients.items()))
+            log.warning("max %d clients: oudste verbinding (%s) vervangen door %s",
+                        MAX_CLIENTS, oldest_host, host)
+            self.clients.pop(oldest, None)
+            try:
+                oldest.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self.clients[writer] = host
         log.info("client %s connected (%d active)", host, len(self.clients))
         try:
             while True:
@@ -167,7 +175,7 @@ class Proxy:
         except Exception:  # noqa: BLE001
             pass
         finally:
-            self.clients.discard(writer)
+            self.clients.pop(writer, None)
             try:
                 writer.close()
             except Exception:  # noqa: BLE001

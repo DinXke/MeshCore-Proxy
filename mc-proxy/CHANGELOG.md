@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.2
+
+- Bij het bereiken van `max_clients` wordt de oudste verbinding vervangen
+  in plaats van de nieuwe geweigerd — gestrande sessies (bv. agressieve
+  reconnects van een client) verstoppen de proxy niet meer.
+
 ## 1.1.1
 
 - Verbindingen vanaf de Home Assistant-host (localhost/docker-gateway) worden
