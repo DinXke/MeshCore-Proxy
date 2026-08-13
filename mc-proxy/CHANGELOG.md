@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.0
+
+- **Eigen handshake + keepalive naar de node.** De node sluit verbindingen
+  die zich niet aanmelden of te lang stil zijn; de proxy stuurt nu meteen na
+  het verbinden een APP_START en daarna elke 20 s een keepalive. Zonder dit
+  viel de nodeverbinding continu weg en verdwenen clientcommando's in een
+  dode socket (getest: twee gelijktijdige clients krijgen nu allebei een
+  correcte handshake en eigen commando-antwoorden).
+- Antwoorden op de interne handshake/keepalive worden geslikt, niet naar
+  clients gestuurd.
+- Duidelijke waarschuwing in het log wanneer een commando niet doorgestuurd
+  kan worden omdat de node onbereikbaar is.
+
 ## 1.4.0
 
 - **Echte frame-parsing**: het TCP-transport blijkt wél framing te gebruiken

@@ -44,6 +44,22 @@ LISTEN_HOST = os.environ.get("MCP_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("MCP_LISTEN_PORT", "5000"))
 MAX_CLIENTS = int(os.environ.get("MCP_MAX_CLIENTS", "8"))
 IDLE_EVICT_S = float(os.environ.get("MCP_IDLE_EVICT_S", "60"))
+KEEPALIVE_S = float(os.environ.get("MCP_KEEPALIVE_S", "20"))
+
+# Companion-protocol: frames zijn marker + LE16-lengte + payload.
+# 0x3C ('<') client->node, 0x3E ('>') node->client.
+CMD_APP_START = 0x01
+CMD_GET_DEVICE_TIME = 0x05
+
+
+def frame(payload: bytes) -> bytes:
+    return b"<" + len(payload).to_bytes(2, "little") + payload
+
+
+# De proxy meldt zich zelf aan bij de node; zonder deze handshake sluit de
+# node de verbinding weer (dat is precies waarom een 'stille' proxy faalt).
+APP_START = frame(bytes([CMD_APP_START, 0x03]) + b"      " + b"mcproxy")
+DEVICE_TIME = frame(bytes([CMD_GET_DEVICE_TIME]))
 RECONNECT_S = float(os.environ.get("MCP_RECONNECT_S", "1"))
 CHUNK = 4096
 
@@ -112,6 +128,9 @@ class Proxy:
         self.current_commander: asyncio.StreamWriter | None = None
         self._resp_seen = asyncio.Event()
         self._last_resp_t = 0.0
+        # antwoorden op onze eigen handshake/keepalive slikken we op
+        self._internal_pending = 0
+        self._last_upstream_tx = 0.0
 
     async def upstream_loop(self) -> None:
         """Keep the single node connection alive; reconnect on loss."""
@@ -121,6 +140,8 @@ class Proxy:
                 self.up_writer = writer
                 self._was_connected = True
                 log.info("connected to node %s:%s", NODE_HOST, NODE_PORT)
+                # meteen aanmelden, anders sluit de node de verbinding weer
+                await self._send_internal(APP_START)
                 buf = b""
                 while True:
                     data = await reader.read(CHUNK)
@@ -155,6 +176,35 @@ class Proxy:
                 self.up_writer = None
                 await asyncio.sleep(RECONNECT_S)
 
+    async def _send_internal(self, data: bytes) -> None:
+        """Stuur een eigen frame (handshake/keepalive) naar de node; het
+        antwoord wordt geslikt in plaats van naar clients gestuurd."""
+        up = self.up_writer
+        if up is None:
+            return
+        try:
+            self._internal_pending += 1
+            self._last_upstream_tx = asyncio.get_running_loop().time()
+            up.write(data)
+            await up.drain()
+        except Exception:  # noqa: BLE001
+            self._internal_pending = max(0, self._internal_pending - 1)
+
+    async def keepalive_loop(self) -> None:
+        """Houd de nodeverbinding warm; een stille verbinding wordt door de
+        node gesloten."""
+        while True:
+            await asyncio.sleep(KEEPALIVE_S / 2)
+            loop = asyncio.get_running_loop()
+            if self.up_writer is None:
+                continue
+            if loop.time() - self._last_upstream_tx < KEEPALIVE_S:
+                continue
+            if self.cmd_lock.locked():
+                continue
+            async with self.cmd_lock:
+                await self._send_internal(DEVICE_TIME)
+
     async def dispatch(self, frame: bytes) -> None:
         """Routeer één compleet nodeframe (0x3E + len + payload). Het
         pakkettype staat op offset 3: < 0x80 = command-response (alleen naar
@@ -164,6 +214,11 @@ class Proxy:
             target = self.current_commander
             self._last_resp_t = asyncio.get_running_loop().time()
             self._resp_seen.set()
+            if target is None and self._internal_pending > 0:
+                # antwoord op onze eigen handshake/keepalive
+                self._internal_pending -= 1
+                log.debug("intern antwoord geslikt (type 0x%02x)", ptype)
+                return
             if target is not None and target in self.clients:
                 try:
                     target.write(frame)
@@ -196,12 +251,15 @@ class Proxy:
             self._resp_seen.clear()
             up = self.up_writer
             if up is None:
+                log.warning("commando genegeerd: geen verbinding met de node")
                 self.current_commander = None
                 return
             try:
+                self._last_upstream_tx = loop.time()
                 up.write(data)
                 await up.drain()
-            except Exception:  # noqa: BLE001
+            except Exception as err:  # noqa: BLE001
+                log.warning("doorsturen naar node mislukt: %s", err)
                 self.current_commander = None
                 return
             if not expect_response:
@@ -303,7 +361,8 @@ async def main() -> None:
     if ALLOWED:
         log.info("altijd toegelaten (host/gateway): %s", ", ".join(sorted(ALWAYS_ALLOWED)))
     async with server:
-        await asyncio.gather(server.serve_forever(), proxy.upstream_loop())
+        await asyncio.gather(server.serve_forever(), proxy.upstream_loop(),
+                             proxy.keepalive_loop())
 
 
 if __name__ == "__main__":
