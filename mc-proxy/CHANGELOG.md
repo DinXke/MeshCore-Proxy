@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.1
+
+- Responsvenster van 2 s naar 8 s: een trage of net herstarte node antwoordt
+  soms pas na seconden, waardoor antwoorden de client niet bereikten
+- Interne handshake/keepalive-antwoorden worden alleen nog binnen 5 s na het
+  verzenden geslikt (voorkomt dat late clientantwoorden verdwijnen)
+- Bij verlies van de nodeverbinding worden alle clientsessies gesloten; ze
+  verbinden vanzelf opnieuw zodra de node er weer is (voorkomt dichtslibben)
+- Standaard `max_clients` van 8 naar 32 (meshcore-ha opent er zelf al 4-8)
+
 ## 1.5.0
 
 - **Eigen handshake + keepalive naar de node.** De node sluit verbindingen

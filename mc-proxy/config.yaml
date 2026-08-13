@@ -1,5 +1,5 @@
 name: MeshCore Proxy
-version: "1.5.0"
+version: "1.5.1"
 slug: mc_proxy
 description: >-
   TCP fan-out proxy that lets multiple companions (Home Assistant
@@ -27,5 +27,5 @@ schema:
   node_port: port
   allowed_ips:
     - str
-  max_clients: int(1,16)
+  max_clients: int(1,64)
   log_level: list(debug|info|warning)

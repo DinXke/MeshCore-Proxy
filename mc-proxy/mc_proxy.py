@@ -42,9 +42,13 @@ NODE_HOST = os.environ.get("MCP_NODE_HOST", "")
 NODE_PORT = int(os.environ.get("MCP_NODE_PORT", "5000"))
 LISTEN_HOST = os.environ.get("MCP_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("MCP_LISTEN_PORT", "5000"))
-MAX_CLIENTS = int(os.environ.get("MCP_MAX_CLIENTS", "8"))
+MAX_CLIENTS = int(os.environ.get("MCP_MAX_CLIENTS", "32"))
 IDLE_EVICT_S = float(os.environ.get("MCP_IDLE_EVICT_S", "60"))
 KEEPALIVE_S = float(os.environ.get("MCP_KEEPALIVE_S", "20"))
+# Hoe lang een client de responsestroom exclusief krijgt na zijn commando.
+# Ruim genomen: een trage of net herstarte node antwoordt soms pas na seconden.
+RESP_TIMEOUT_S = float(os.environ.get("MCP_RESP_TIMEOUT_S", "8"))
+RESP_QUIET_S = float(os.environ.get("MCP_RESP_QUIET_S", "0.25"))
 
 # Companion-protocol: frames zijn marker + LE16-lengte + payload.
 # 0x3C ('<') client->node, 0x3E ('>') node->client.
@@ -128,8 +132,11 @@ class Proxy:
         self.current_commander: asyncio.StreamWriter | None = None
         self._resp_seen = asyncio.Event()
         self._last_resp_t = 0.0
-        # antwoorden op onze eigen handshake/keepalive slikken we op
+        # antwoorden op onze eigen handshake/keepalive slikken we op, maar
+        # alleen binnen een kort venster — anders zou een laat clientantwoord
+        # per ongeluk verdwijnen
         self._internal_pending = 0
+        self._internal_until = 0.0
         self._last_upstream_tx = 0.0
 
     async def upstream_loop(self) -> None:
@@ -174,7 +181,21 @@ class Proxy:
                     except Exception:  # noqa: BLE001
                         pass
                 self.up_writer = None
+                # Zonder node zijn clientsessies waardeloos: sluit ze zodat
+                # niemand op een dode lijn wacht en slots niet dichtslibben.
+                await self.drop_clients("nodeverbinding weg")
                 await asyncio.sleep(RECONNECT_S)
+
+    async def drop_clients(self, reason: str) -> None:
+        if not self.clients:
+            return
+        log.info("alle %d clientverbindingen gesloten (%s)", len(self.clients), reason)
+        for w in list(self.clients):
+            try:
+                w.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self.clients.clear()
 
     async def _send_internal(self, data: bytes) -> None:
         """Stuur een eigen frame (handshake/keepalive) naar de node; het
@@ -183,8 +204,10 @@ class Proxy:
         if up is None:
             return
         try:
+            loop = asyncio.get_running_loop()
             self._internal_pending += 1
-            self._last_upstream_tx = asyncio.get_running_loop().time()
+            self._internal_until = loop.time() + 5.0
+            self._last_upstream_tx = loop.time()
             up.write(data)
             await up.drain()
         except Exception:  # noqa: BLE001
@@ -214,7 +237,8 @@ class Proxy:
             target = self.current_commander
             self._last_resp_t = asyncio.get_running_loop().time()
             self._resp_seen.set()
-            if target is None and self._internal_pending > 0:
+            if (target is None and self._internal_pending > 0
+                    and self._last_resp_t < self._internal_until):
                 # antwoord op onze eigen handshake/keepalive
                 self._internal_pending -= 1
                 log.debug("intern antwoord geslikt (type 0x%02x)", ptype)
@@ -267,13 +291,13 @@ class Proxy:
                 return
             try:
                 # wacht op de eerste responseframe...
-                await asyncio.wait_for(self._resp_seen.wait(), timeout=2.0)
-                # ...en daarna tot het 0,25 s stil is (meerdelige antwoorden)
+                await asyncio.wait_for(self._resp_seen.wait(), timeout=RESP_TIMEOUT_S)
+                # ...en daarna tot het even stil is (meerdelige antwoorden)
                 while True:
                     gap = loop.time() - self._last_resp_t
-                    if gap >= 0.25:
+                    if gap >= RESP_QUIET_S:
                         break
-                    await asyncio.sleep(0.25 - gap)
+                    await asyncio.sleep(RESP_QUIET_S - gap)
             except asyncio.TimeoutError:
                 pass  # commando zonder (tijdig) antwoord
             finally:
