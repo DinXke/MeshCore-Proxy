@@ -34,6 +34,7 @@ Configuration is taken from environment variables:
 """
 import asyncio
 import ipaddress
+import json
 import logging
 import os
 import sys
@@ -51,6 +52,7 @@ RESP_TIMEOUT_S = float(os.environ.get("MCP_RESP_TIMEOUT_S", "8"))
 RESP_QUIET_S = float(os.environ.get("MCP_RESP_QUIET_S", "0.25"))
 HANDSHAKE_TIMEOUT_S = float(os.environ.get("MCP_HANDSHAKE_TIMEOUT_S", "10"))
 MAX_SILENT_ROUNDS = int(os.environ.get("MCP_MAX_SILENT_ROUNDS", "2"))
+HEALTH_PORT = int(os.environ.get("MCP_HEALTH_PORT", "5001"))
 
 # Companion-protocol: frames zijn marker + LE16-lengte + payload.
 # 0x3C ('<') client->node, 0x3E ('>') node->client.
@@ -413,6 +415,44 @@ class Proxy:
             log.info("client %s disconnected (%d left)", host, len(self.clients))
 
 
+async def health_server(proxy: "Proxy") -> None:
+    """Mini-HTTP-statuspagina: http://<host>:<health_port>/ geeft JSON met de
+    toestand van de nodeverbinding en de clients. Handig om op afstand te zien
+    of de node antwoordt zonder in de add-on-logs te moeten duiken."""
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await asyncio.wait_for(reader.readline(), timeout=5)
+            loop = asyncio.get_running_loop()
+            body = json.dumps({
+                "node_host": f"{NODE_HOST}:{NODE_PORT}",
+                "node_connected": proxy.up_writer is not None,
+                "node_answering": proxy._node_alive,
+                "seconds_since_node_data": (
+                    None if not proxy._last_node_rx
+                    else round(loop.time() - proxy._last_node_rx, 1)),
+                "silent_keepalive_rounds": proxy._silent_rounds,
+                "clients": [m["host"] for m in proxy.clients.values()],
+                "client_count": len(proxy.clients),
+                "max_clients": MAX_CLIENTS,
+            }, indent=1).encode()
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                         b"Content-Length: " + str(len(body)).encode() +
+                         b"\r\nConnection: close\r\n\r\n" + body)
+            await writer.drain()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    server = await asyncio.start_server(handle, LISTEN_HOST, HEALTH_PORT)
+    log.info("statuspagina op http://%s:%s/", LISTEN_HOST, HEALTH_PORT)
+    async with server:
+        await server.serve_forever()
+
+
 async def main() -> None:
     level = getattr(logging, os.environ.get("MCP_LOG_LEVEL", "info").upper(), logging.INFO)
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
@@ -428,7 +468,7 @@ async def main() -> None:
         log.info("altijd toegelaten (host/gateway): %s", ", ".join(sorted(ALWAYS_ALLOWED)))
     async with server:
         await asyncio.gather(server.serve_forever(), proxy.upstream_loop(),
-                             proxy.keepalive_loop())
+                             proxy.keepalive_loop(), health_server(proxy))
 
 
 if __name__ == "__main__":

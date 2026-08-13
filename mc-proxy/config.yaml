@@ -1,5 +1,5 @@
 name: MeshCore Proxy
-version: "1.6.0"
+version: "1.7.0"
 slug: mc_proxy
 description: >-
   TCP fan-out proxy that lets multiple companions (Home Assistant
@@ -14,8 +14,10 @@ boot: auto
 init: false
 ports:
   5000/tcp: 5000
+  5001/tcp: 5001
 ports_description:
   5000/tcp: Proxy-poort waarop companions verbinden
+  5001/tcp: Statuspagina (JSON) met de toestand van node en clients
 options:
   node_host: ""
   node_port: 5000

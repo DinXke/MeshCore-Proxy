@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.0
+
+- **Statuspagina** op poort 5001 (JSON): laat zien of de node verbonden is,
+  of hij antwoordt, hoelang geleden er data kwam en welke clients er hangen.
+  Zo is een probleem op afstand te zien zonder in de logs te duiken.
+
 ## 1.6.0
 
 - **Zelfherstel bij een vastgelopen node.** De companion-firmware kan in een
