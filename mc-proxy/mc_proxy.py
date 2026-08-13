@@ -54,6 +54,11 @@ MAX_RECONNECT_S = float(os.environ.get("MCP_MAX_RECONNECT_S", "15"))
 HEALTH_PORT = int(os.environ.get("MCP_HEALTH_PORT", "5001"))
 # Hoelang de node weg mag zijn voor clients losgekoppeld worden
 NODE_DOWN_GRACE_S = float(os.environ.get("MCP_NODE_DOWN_GRACE_S", "60"))
+# Minimale tussentijd tussen commando's naar de node. Meerdere clients samen
+# (de HA-integratie opent er zelf al een handvol) kunnen een klein radio-apparaat
+# overspoelen; met deze pacing krijgt de node dezelfde rustige stroom als bij
+# één enkele client.
+MIN_CMD_GAP_S = float(os.environ.get("MCP_MIN_CMD_GAP_S", "0.25"))
 
 # Companion-protocol: frames zijn marker + LE16-lengte + payload.
 # 0x3C ('<') client->node, 0x3E ('>') node->client.
@@ -342,8 +347,13 @@ class Proxy:
             if up is None:
                 log.warning("commando genegeerd: geen verbinding met de node")
                 return
+            # commando's netjes spreiden zodat de node niet overspoeld raakt
+            loop = asyncio.get_running_loop()
+            gap = loop.time() - self._last_upstream_tx
+            if gap < MIN_CMD_GAP_S:
+                await asyncio.sleep(MIN_CMD_GAP_S - gap)
             try:
-                self._last_upstream_tx = asyncio.get_running_loop().time()
+                self._last_upstream_tx = loop.time()
                 up.write(data)
                 await up.drain()
             except Exception as err:  # noqa: BLE001

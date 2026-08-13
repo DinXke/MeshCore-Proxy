@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.8.4
+
+- **Commando's worden gedoseerd** (standaard minstens 0,25 s tussen twee
+  commando's naar de node). De Home Assistant-integratie opent meerdere
+  verbindingen tegelijk; rechtstreeks op de node paste er maar één, maar via
+  de proxy komen ze er allemaal door en kan een klein radio-apparaat
+  overspoeld raken — met wegvallende verbindingen tot gevolg.
+
 ## 1.8.3
 
 - **Belangrijke fix**: de handshake-watchdog van een oudere verbindingspoging
