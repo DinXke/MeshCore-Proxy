@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.8.3
+
+- **Belangrijke fix**: de handshake-watchdog van een oudere verbindingspoging
+  kon een nieuwe, gezonde nodeverbinding afbreken. Op een trage link stapelden
+  die wachters zich op, waardoor de proxy zijn eigen werkende verbindingen
+  om de paar seconden verbrak — precies het "node antwoordt / verbinding weg"-
+  patroon in de logs. Elke watchdog bewaakt nu alleen zijn eigen verbinding.
+
 ## 1.8.2
 
 - **Geduldiger tegenover een zwakke node.** Op een slechte wifi-link maakte de

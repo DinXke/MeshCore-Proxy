@@ -168,7 +168,7 @@ class Proxy:
                 # Antwoordt de node niet op de handshake, dan is de firmware
                 # vastgelopen: verbinding sluiten en opnieuw proberen. Een
                 # verse TCP-sessie brengt een half-vastgelopen node meestal bij.
-                asyncio.create_task(self._handshake_watchdog())
+                asyncio.create_task(self._handshake_watchdog(writer))
                 buf = b""
                 while True:
                     data = await reader.read(CHUNK)
@@ -218,16 +218,20 @@ class Proxy:
                                             f"{NODE_DOWN_GRACE_S:.0f}s onbereikbaar")
                 await asyncio.sleep(backoff)
 
-    async def _handshake_watchdog(self) -> None:
+    async def _handshake_watchdog(self, writer: asyncio.StreamWriter) -> None:
         """Sluit de nodeverbinding pas als de node ook na een herkansing niets
-        terugstuurt. Op een zwakke link is geduld beter dan opnieuw verbinden."""
+        terugstuurt. Op een zwakke link is geduld beter dan opnieuw verbinden.
+
+        De watchdog bewaakt precies de verbinding waarvoor hij gestart is: een
+        watchdog van een oudere poging mag nooit een nieuwe, gezonde
+        verbinding afbreken."""
         await asyncio.sleep(HANDSHAKE_TIMEOUT_S / 2)
-        if self._node_alive or self.up_writer is None:
+        if self._node_alive or self.up_writer is not writer:
             return
         log.info("nog geen antwoord op de handshake; nog één poging")
         await self._send_internal(APP_START)
         await asyncio.sleep(HANDSHAKE_TIMEOUT_S / 2)
-        if self._node_alive or self.up_writer is None:
+        if self._node_alive or self.up_writer is not writer:
             return
         log.warning("node antwoordt niet op de handshake (firmware vastgelopen?); "
                     "verbinding opnieuw opbouwen")
