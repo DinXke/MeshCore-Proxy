@@ -121,11 +121,28 @@ class Proxy:
                 self.up_writer = writer
                 self._was_connected = True
                 log.info("connected to node %s:%s", NODE_HOST, NODE_PORT)
+                buf = b""
                 while True:
                     data = await reader.read(CHUNK)
                     if not data:
                         raise ConnectionError("node closed the connection")
-                    await self.dispatch(data)
+                    buf += data
+                    # Node -> client frames: 0x3E ('>') + lengte (LE16) + payload
+                    while True:
+                        if len(buf) < 3:
+                            break
+                        if buf[0] != 0x3E:
+                            # onbekende bytes: geef door en hersynchroniseer
+                            nxt = buf.find(b">", 1)
+                            junk, buf = (buf, b"") if nxt < 0 else (buf[:nxt], buf[nxt:])
+                            log.debug("onbekende node-bytes (%d) doorgestuurd", len(junk))
+                            await self.broadcast(junk)
+                            continue
+                        ln = buf[1] | (buf[2] << 8)
+                        if len(buf) < 3 + ln:
+                            break
+                        frame, buf = buf[:3 + ln], buf[3 + ln:]
+                        await self.dispatch(frame)
             except Exception as err:  # noqa: BLE001
                 level = logging.WARNING if self._was_connected else logging.DEBUG
                 log.log(level, "node connection lost (%s); retry in %ss", err, RECONNECT_S)
@@ -138,22 +155,23 @@ class Proxy:
                 self.up_writer = None
                 await asyncio.sleep(RECONNECT_S)
 
-    async def dispatch(self, data: bytes) -> None:
-        """Routeer node-data: push-frames (eerste byte >= 0x80, bv. adverts en
-        inkomende berichten) naar alle clients; command-responses alleen naar
-        de client wiens commando op dit moment in behandeling is."""
-        if data and data[0] < 0x80:
+    async def dispatch(self, frame: bytes) -> None:
+        """Routeer één compleet nodeframe (0x3E + len + payload). Het
+        pakkettype staat op offset 3: < 0x80 = command-response (alleen naar
+        de huidige vrager), >= 0x80 = push (naar alle clients)."""
+        ptype = frame[3] if len(frame) >= 4 else 0
+        if ptype < 0x80:
             target = self.current_commander
             self._last_resp_t = asyncio.get_running_loop().time()
             self._resp_seen.set()
             if target is not None and target in self.clients:
                 try:
-                    target.write(data)
+                    target.write(frame)
                     await target.drain()
                     return
                 except Exception:  # noqa: BLE001
                     self.clients.pop(target, None)
-        await self.broadcast(data)
+        await self.broadcast(frame)
 
     async def broadcast(self, data: bytes) -> None:
         dead = []
@@ -166,11 +184,12 @@ class Proxy:
         for w in dead:
             self.clients.pop(w, None)
 
-    async def _exchange(self, writer: asyncio.StreamWriter, data: bytes) -> None:
-        """Stuur één commando naar de node en reserveer de responsestroom voor
-        deze client tot het antwoord compleet is (korte stilte na de laatste
-        responseframe) of de timeout verstrijkt. Commando's van andere clients
-        wachten netjes hun beurt af."""
+    async def _exchange(self, writer: asyncio.StreamWriter, data: bytes,
+                        expect_response: bool = True) -> None:
+        """Stuur één commandoframe naar de node en reserveer de responsestroom
+        voor deze client tot het antwoord compleet is (korte stilte na de
+        laatste responseframe) of de timeout verstrijkt. Commando's van andere
+        clients wachten netjes hun beurt af."""
         loop = asyncio.get_running_loop()
         async with self.cmd_lock:
             self.current_commander = writer
@@ -183,6 +202,9 @@ class Proxy:
                 up.write(data)
                 await up.drain()
             except Exception:  # noqa: BLE001
+                self.current_commander = None
+                return
+            if not expect_response:
                 self.current_commander = None
                 return
             try:
@@ -232,6 +254,7 @@ class Proxy:
         self.clients[writer] = {"host": host, "last_tx": loop.time()}
         log.info("client %s connected (%d active)", host, len(self.clients))
         try:
+            buf = b""
             while True:
                 data = await reader.read(CHUNK)
                 if not data:
@@ -239,7 +262,22 @@ class Proxy:
                 meta = self.clients.get(writer)
                 if meta is not None:
                     meta["last_tx"] = asyncio.get_running_loop().time()
-                await self._exchange(writer, data)
+                buf += data
+                # Client -> node frames: 0x3C ('<') + lengte (LE16) + payload;
+                # elk compleet commandoframe wordt als één exchange behandeld
+                while True:
+                    if len(buf) < 3:
+                        break
+                    if buf[0] != 0x3C:
+                        nxt = buf.find(b"<", 1)
+                        junk, buf = (buf, b"") if nxt < 0 else (buf[:nxt], buf[nxt:])
+                        await self._exchange(writer, junk, expect_response=False)
+                        continue
+                    ln = buf[1] | (buf[2] << 8)
+                    if len(buf) < 3 + ln:
+                        break
+                    frame, buf = buf[:3 + ln], buf[3 + ln:]
+                    await self._exchange(writer, frame)
         except Exception:  # noqa: BLE001
             pass
         finally:

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.0
+
+- **Echte frame-parsing**: het TCP-transport blijkt wél framing te gebruiken
+  (0x3C/0x3E + 16-bit lengte + payload). De proxy parseert nu complete
+  frames in beide richtingen; het pakkettype (offset 3) bepaalt de routering:
+  responses naar de vrager, pushes naar iedereen. Eerdere versies keken naar
+  de framemarker en routeerden daardoor alles verkeerd.
+
 ## 1.3.0
 
 - **Exchange-serialisatie**: één command/response-uitwisseling tegelijk over
