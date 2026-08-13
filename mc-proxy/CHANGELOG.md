@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0
+
+- **Exchange-serialisatie**: één command/response-uitwisseling tegelijk over
+  de node; zolang een commando loopt gaan alle responseframes gegarandeerd
+  naar de vrager (stiltedetectie voor meerdelige antwoorden, max 2 s).
+  Lost handshake-races op wanneer meerdere clients (of meerdere verbindingen
+  van dezelfde integratie) tegelijk commando's sturen.
+
 ## 1.2.0
 
 - **Slimme routering**: command-responses van de node gaan alleen nog naar de

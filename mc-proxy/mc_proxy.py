@@ -104,11 +104,14 @@ class Proxy:
         # zodat we bij een volle bak alleen echt inactieve sessies vervangen
         self.clients: dict[asyncio.StreamWriter, dict] = {}
         self.up_writer: asyncio.StreamWriter | None = None
-        self.write_lock = asyncio.Lock()
         self._was_connected = False
-        # de client die het laatst een commando stuurde: responses gaan alleen
-        # daarheen; push-frames (eerste byte >= 0x80) gaan naar iedereen
-        self.last_commander: asyncio.StreamWriter | None = None
+        # Eén command/response-uitwisseling tegelijk: zolang een commando
+        # loopt gaan alle response-frames naar precies die vrager. Push-frames
+        # (eerste byte >= 0x80) gaan altijd naar iedereen.
+        self.cmd_lock = asyncio.Lock()
+        self.current_commander: asyncio.StreamWriter | None = None
+        self._resp_seen = asyncio.Event()
+        self._last_resp_t = 0.0
 
     async def upstream_loop(self) -> None:
         """Keep the single node connection alive; reconnect on loss."""
@@ -138,10 +141,11 @@ class Proxy:
     async def dispatch(self, data: bytes) -> None:
         """Routeer node-data: push-frames (eerste byte >= 0x80, bv. adverts en
         inkomende berichten) naar alle clients; command-responses alleen naar
-        de client die het laatst een commando stuurde. Zo raakt geen enkele
-        client in de war van andermans antwoorden."""
+        de client wiens commando op dit moment in behandeling is."""
         if data and data[0] < 0x80:
-            target = self.last_commander
+            target = self.current_commander
+            self._last_resp_t = asyncio.get_running_loop().time()
+            self._resp_seen.set()
             if target is not None and target in self.clients:
                 try:
                     target.write(data)
@@ -161,6 +165,39 @@ class Proxy:
                 dead.append(w)
         for w in dead:
             self.clients.pop(w, None)
+
+    async def _exchange(self, writer: asyncio.StreamWriter, data: bytes) -> None:
+        """Stuur één commando naar de node en reserveer de responsestroom voor
+        deze client tot het antwoord compleet is (korte stilte na de laatste
+        responseframe) of de timeout verstrijkt. Commando's van andere clients
+        wachten netjes hun beurt af."""
+        loop = asyncio.get_running_loop()
+        async with self.cmd_lock:
+            self.current_commander = writer
+            self._resp_seen.clear()
+            up = self.up_writer
+            if up is None:
+                self.current_commander = None
+                return
+            try:
+                up.write(data)
+                await up.drain()
+            except Exception:  # noqa: BLE001
+                self.current_commander = None
+                return
+            try:
+                # wacht op de eerste responseframe...
+                await asyncio.wait_for(self._resp_seen.wait(), timeout=2.0)
+                # ...en daarna tot het 0,25 s stil is (meerdelige antwoorden)
+                while True:
+                    gap = loop.time() - self._last_resp_t
+                    if gap >= 0.25:
+                        break
+                    await asyncio.sleep(0.25 - gap)
+            except asyncio.TimeoutError:
+                pass  # commando zonder (tijdig) antwoord
+            finally:
+                self.current_commander = None
 
     async def handle_client(self, reader: asyncio.StreamReader,
                             writer: asyncio.StreamWriter) -> None:
@@ -202,12 +239,7 @@ class Proxy:
                 meta = self.clients.get(writer)
                 if meta is not None:
                     meta["last_tx"] = asyncio.get_running_loop().time()
-                async with self.write_lock:
-                    self.last_commander = writer
-                    up = self.up_writer
-                    if up is not None:
-                        up.write(data)
-                        await up.drain()
+                await self._exchange(writer, data)
         except Exception:  # noqa: BLE001
             pass
         finally:
